@@ -1,0 +1,141 @@
+name: Earth Met 3D Environment Setup & Sync
+
+on:
+  schedule:
+    # Safety reset trigger once a day at midnight UTC in case of network drops
+    - cron: '0 0 * * *'
+  workflow_dispatch: # Allows manual trigger & self-renewal triggers
+
+# Ensures ONLY ONE instance of this workflow runs at any time
+concurrency:
+  group: earth-met-single-daemon
+  cancel-in-progress: false
+
+jobs:
+  run-sync-daemon:
+    runs-on: macOS-latest
+
+    permissions:
+      contents: write
+      actions: write # Required for self-renewal trigger
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install System & Python Dependencies
+        run: |
+          python3 -m pip install --upgrade pip
+          python3 -m pip install herbie-data xarray cfgrib pillow numpy scipy
+
+      - name: Run 5.5-Hour Sync Daemon Loop
+        run: |
+          # 19,800 seconds = 5.5 hours (safe margin before 6-hour GitHub runner limit)
+          END_TIME=$(($(date +%s) + 19800))
+          # SLEEP_INTERVAL set to 1 hour (3600s) or whatever gap you want between cycles
+          SLEEP_INTERVAL=14400
+          BRANCH_NAME="main"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          while [ $(date +%s) -lt $END_TIME ]; do
+            echo "=================================================="
+            echo "Starting update cycle at $(date -u)"
+            echo "=================================================="
+
+            TEXTURES_DIR="textures"
+            HERBIE_CACHE_DIR="$HOME/rubicon_data"
+
+            # Reset branch to orphan temporary branch to clear past history
+            git checkout --orphan temp_branch 2>/dev/null || git checkout temp_branch
+
+            # --------------------------------------------------
+            # COMMIT 1: Purge & Clean Old Files
+            # --------------------------------------------------
+            echo "--------------------------------------------------"
+            echo "[Commit 1/3] Clearing previous textures & cache..."
+
+            if [ -d "$TEXTURES_DIR" ]; then
+                rm -f "$TEXTURES_DIR"/*.png
+                rm -f "$TEXTURES_DIR"/*.json
+            else
+                mkdir -p "$TEXTURES_DIR"
+            fi
+
+            if [ -d "$HERBIE_CACHE_DIR" ]; then
+                rm -rf "$HERBIE_CACHE_DIR"/*
+            fi
+
+            find . -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
+
+            git add -A
+            git commit -m "Step 1/3: Purge old textures and cache [$(date -u +'%Y-%m-%d %H:%M UTC')]" || true
+            
+            # Set main branch and push Step 1
+            git branch -D "$BRANCH_NAME" 2>/dev/null || true
+            git branch -m "$BRANCH_NAME"
+            echo "Pushing Commit 1 to remote..."
+            git push -f origin "$BRANCH_NAME"
+
+            # --------------------------------------------------
+            # COMMIT 2: Download Data & Generate New Textures
+            # --------------------------------------------------
+            echo "--------------------------------------------------"
+            echo "[Commit 2/3] Generating new weather textures..."
+
+            python3 download.py
+
+            git add -A
+            git commit -m "Step 2/3: Generate fresh weather textures [$(date -u +'%Y-%m-%d %H:%M UTC')]" || true
+            echo "Pushing Commit 2 to remote..."
+            git push origin "$BRANCH_NAME"
+
+            # --------------------------------------------------
+            # COMMIT 3: Storage Cleanup & Final Manifest Sync
+            # --------------------------------------------------
+            echo "--------------------------------------------------"
+            echo "[Commit 3/3] Pruning storage & updating manifest..."
+
+            if [ -d "$HERBIE_CACHE_DIR" ]; then
+                rm -rf "$HERBIE_CACHE_DIR"/*
+            fi
+
+            git add -A
+            git commit -m "Step 3/3: Complete cycle & prune storage [$(date -u +'%Y-%m-%d %H:%M UTC')]" || true
+            echo "Pushing Commit 3 to remote..."
+            git push origin "$BRANCH_NAME"
+
+            # Reclaim Git repository disk space locally
+            echo "Reclaiming local Git storage space..."
+            git reflog expire --expire=now --all
+            git gc --prune=now --aggressive
+
+            echo "--------------------------------------------------"
+            echo "Cycle complete (3 commits pushed). Sleeping for $SLEEP_INTERVAL seconds..."
+            
+            # Prevent sleeping past the 5.5-hour limit
+            CURRENT_TIME=$(date +%s)
+            if [ $((CURRENT_TIME + SLEEP_INTERVAL)) -gt $END_TIME ]; then
+                echo "Next sleep would exceed 5.5h runner limit. Ending job loop now..."
+                break
+            fi
+            sleep $SLEEP_INTERVAL
+          done
+
+          echo "⌛ 5.5 hours reached. Preparing handoff to next runner..."
+
+      - name: Self-Renewal Handoff (Trigger Next Run)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "⚡ Triggering next self-renewal workflow run..."
+          gh workflow run earth_met.yml --ref main
