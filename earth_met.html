@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-  <title>Earth Met 3D - Contour Filled + White Particles (0-360°)</title>
+  <title>Earth Met 3D - Global Multi-Level Forecast</title>
   <style>
     * {
       box-sizing: border-box;
@@ -250,7 +250,7 @@
   <div id="canvas-container"></div>
 
   <!-- Toggle Options Button -->
-  <button id="toggle-ui-btn">⚙️ Options</button>
+  <button id="toggle-ui-btn">⚙ Options</button>
 
   <div id="wind-popup">
     <div class="popup-title" id="pop-coords">0.0°N, 0.0°E</div>
@@ -264,8 +264,7 @@
     <div class="control-group">
       <label for="modelSelect">Model</label>
       <select id="modelSelect">
-        <option value="gfs">GFS (NOAA 0.25°)</option>
-        <option value="aigfs">AIGFS (Machine Learning)</option>
+        <option value="gfs" selected>GFS (NOAA 0.25°)</option>
         <option value="ifs">ECMWF IFS</option>
         <option value="aifs">ECMWF AIFS</option>
       </select>
@@ -274,18 +273,18 @@
     <div class="control-group">
       <label for="levelSelect">Pressure Level</label>
       <select id="levelSelect">
-        <option value="10m" selected>Surface (10m)</option>
+        <option value="10m" selected>Surface (10m Wind)</option>
         <option value="925hPa">925 hPa (~750m)</option>
         <option value="850hPa">850 hPa (~1.5km)</option>
-        <option value="700hPa">700 hPa (~3km)</option>
+        <option value="700hPa">700 hPa (~3.0km)</option>
         <option value="500hPa">500 hPa (~5.5km)</option>
-        <option value="200hPa">200 hPa (~12km / Jet Stream)</option>
+        <option value="200hPa">200 hPa (~12.0km Jetstream)</option>
       </select>
     </div>
 
     <div class="control-group">
-      <label>Forecast Step <span id="fxxVal" class="slider-val">+00h</span></label>
-      <input type="range" id="fxxSlider" min="0" max="228" step="6" value="0">
+      <label>Forecast Step <span id="fxxVal" class="slider-val">+000h</span></label>
+      <input type="range" id="fxxSlider" min="0" max="240" step="6" value="0">
       
       <div class="time-info">
         <div class="time-row">
@@ -334,7 +333,6 @@
   </div>
 
   <script>
-    // Panel Toggle Handler
     const toggleBtn = document.getElementById('toggle-ui-btn');
     const uiPanel = document.getElementById('ui-panel');
 
@@ -366,18 +364,17 @@
     controls.enableDamping = true;
     controls.dampingFactor = 0.05;
 
-    // Wind Scale Interpolator (0 - 100 knots RGB Lookup)
     function getWindColor0to100kts(kts) {
       const norm = Math.min(Math.max(kts / 100.0, 0.0), 1.0);
       const stops = [
-        { pos: 0.00, r: 50,  g: 0,   b: 100 }, // Deep Purple
-        { pos: 0.15, r: 0,   g: 0,   b: 255 }, // Blue
-        { pos: 0.30, r: 0,   g: 170, b: 255 }, // Cyan
-        { pos: 0.45, r: 0,   g: 255, b: 0   }, // Green
-        { pos: 0.60, r: 255, g: 255, b: 0   }, // Yellow
-        { pos: 0.75, r: 255, g: 127, b: 0   }, // Orange
-        { pos: 0.90, r: 255, g: 0,   b: 0   }, // Red
-        { pos: 1.00, r: 255, g: 0,   b: 255 }  // Magenta
+        { pos: 0.00, r: 50,  g: 0,   b: 100 },
+        { pos: 0.15, r: 0,   g: 0,   b: 255 },
+        { pos: 0.30, r: 0,   g: 170, b: 255 },
+        { pos: 0.45, r: 0,   g: 255, b: 0   },
+        { pos: 0.60, r: 255, g: 255, b: 0   },
+        { pos: 0.75, r: 255, g: 127, b: 0   },
+        { pos: 0.90, r: 255, g: 0,   b: 0   },
+        { pos: 1.00, r: 255, g: 0,   b: 255 }
       ];
 
       for (let i = 0; i < stops.length - 1; i++) {
@@ -399,7 +396,6 @@
       return { u, v, speed: Math.sqrt(u * u + v * v) };
     }
 
-    // Smooth Canvas Fallback Generator
     function createFallbackCanvasTexture() {
       const canvas = document.createElement('canvas');
       canvas.width = 512;
@@ -432,7 +428,6 @@
       return tex;
     }
 
-    // Globe Base Mesh
     const globeGeo = new THREE.SphereGeometry(1.0, 128, 128);
     const globeMat = new THREE.MeshBasicMaterial({ 
       map: createFallbackCanvasTexture(),
@@ -441,7 +436,6 @@
     const globe = new THREE.Mesh(globeGeo, globeMat);
     scene.add(globe);
 
-    // Inspection Pin
     const pinGeo = new THREE.SphereGeometry(0.012, 16, 16);
     const pinMat = new THREE.MeshBasicMaterial({ color: 0x38bdf8 });
     const pinMesh = new THREE.Mesh(pinGeo, pinMat);
@@ -457,30 +451,19 @@
     const popSpeed = document.getElementById('pop-speed');
     const popExtra = document.getElementById('pop-extra');
 
-    // Coastline Overlay
+    // Coastline Layer
     fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/land-110m.json')
       .then(r => r.json())
       .then(topology => {
         const geojson = topojson.feature(topology, topology.objects.land);
-        const mat = new THREE.LineBasicMaterial({ 
-          color: 0xffffff,
-          transparent: true,
-          opacity: 0.6
-        });
-
+        const mat = new THREE.LineBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.6 });
         const group = new THREE.Group();
         const features = geojson.type === 'FeatureCollection' ? geojson.features : [geojson];
 
         features.forEach(feature => {
           if (!feature.geometry) return;
           const geom = feature.geometry;
-          let polygons = [];
-
-          if (geom.type === 'Polygon') {
-            polygons = [geom.coordinates];
-          } else if (geom.type === 'MultiPolygon') {
-            polygons = geom.coordinates;
-          }
+          let polygons = geom.type === 'Polygon' ? [geom.coordinates] : (geom.type === 'MultiPolygon' ? geom.coordinates : []);
 
           polygons.forEach(polygon => {
             polygon.forEach(ring => {
@@ -497,7 +480,6 @@
                   r * Math.sin(phi) * Math.sin(theta)
                 ));
               });
-
               if (points.length > 1) {
                 group.add(new THREE.Line(new THREE.BufferGeometry().setFromPoints(points), mat));
               }
@@ -507,12 +489,11 @@
         scene.add(group);
       });
 
-    // Pure White Particle Shader Setup
+    // Particle Shader
     const lineShader = {
       vertexShader: `
         attribute float aAlpha;
         varying float vAlpha;
-
         void main() {
           vAlpha = aAlpha;
           vec4 mvPosition = modelViewMatrix * vec4(position, 1.0);
@@ -521,7 +502,6 @@
       `,
       fragmentShader: `
         varying float vAlpha;
-
         void main() {
           gl_FragColor = vec4(1.0, 1.0, 1.0, vAlpha);
         }
@@ -575,44 +555,23 @@
     let currentFxx = 0;
     let uvPixelData = null;
     let metaData = null;
+    let globalCycleStr = '';
 
-    function getDynamicCycleString() {
-      const now = new Date();
-      const utcHours = now.getUTCHours();
-      let cycleDate = new Date(now);
-      let cycleStr = '00';
-
-      if (utcHours >= 8 && utcHours < 20) {
-        cycleStr = '00';
-      } else {
-        cycleStr = '12';
-        if (utcHours < 8) {
-          cycleDate.setUTCDate(cycleDate.getUTCDate() - 1);
-        }
-      }
-
-      const yyyy = cycleDate.getUTCFullYear();
-      const mm = String(cycleDate.getUTCMonth() + 1).padStart(2, '0');
-      const dd = String(cycleDate.getUTCDate()).padStart(2, '0');
-
-      return `${yyyy}-${mm}-${dd} ${cycleStr}:00 UTC`;
-    }
-
-    let globalCycleStr = getDynamicCycleString();
-
-    // Direct Bilinear Wind Sampling from UV texture [0..360, 90..-90]
     function sampleWindBilinear(latDeg, lon360Deg) {
       if (!uvPixelData || !metaData) {
         return sampleSyntheticWind(latDeg, lon360Deg);
       }
 
+      const minLon = metaData.lonRange ? metaData.lonRange[0] : 0.0;
+      const maxLon = metaData.lonRange ? metaData.lonRange[1] : 360.0;
+      const minLat = metaData.latRange ? metaData.latRange[0] : -90.0;
+      const maxLat = metaData.latRange ? metaData.latRange[1] : 90.0;
+
       const w = metaData.width;
       const h = metaData.height;
 
-      const normLon = ((lon360Deg % 360) + 360) % 360;
-
-      const gx = (normLon / 360) * (w - 1);
-      const gy = ((90 - latDeg) / 180) * (h - 1);
+      const gx = ((lon360Deg - minLon) / (maxLon - minLon)) * (w - 1);
+      const gy = ((maxLat - latDeg) / (maxLat - minLat)) * (h - 1);
 
       const x0 = Math.min(Math.max(Math.floor(gx), 0), w - 1);
       const x1 = Math.min(x0 + 1, w - 1);
@@ -624,8 +583,8 @@
 
       function getUV(px, py) {
         const idx = (py * w + px) * 4;
-        const uNorm = uvPixelData[idx] / 255.0;     // Red = U
-        const vNorm = uvPixelData[idx + 1] / 255.0; // Green = V
+        const uNorm = uvPixelData[idx] / 255.0;
+        const vNorm = uvPixelData[idx + 1] / 255.0;
         return {
           u: metaData.uMin + uNorm * (metaData.uMax - metaData.uMin),
           v: metaData.vMin + vNorm * (metaData.vMax - metaData.vMin)
@@ -652,25 +611,23 @@
     }
 
     function updateTimeUI() {
-      if (!globalCycleStr) {
-        globalCycleStr = getDynamicCycleString();
-      }
+      document.getElementById('run-cycle-display').innerText = globalCycleStr || '----';
 
-      document.getElementById('run-cycle-display').innerText = globalCycleStr;
-
-      const baseDate = new Date(globalCycleStr.replace(' ', 'T') + ':00Z');
-      if (!isNaN(baseDate.getTime())) {
-        const validDate = new Date(baseDate.getTime() + currentFxx * 3600 * 1000);
-        document.getElementById('valid-time-display').innerText = formatUTCDate(validDate);
-      } else {
-        document.getElementById('valid-time-display').innerText = `+${currentFxx}h`;
+      if (globalCycleStr) {
+        const baseDate = new Date(globalCycleStr.replace(' ', 'T') + ':00Z');
+        if (!isNaN(baseDate.getTime())) {
+          const validDate = new Date(baseDate.getTime() + currentFxx * 3600 * 1000);
+          document.getElementById('valid-time-display').innerText = formatUTCDate(validDate);
+          return;
+        }
       }
+      document.getElementById('valid-time-display').innerText = `+${currentFxx}h`;
     }
 
     async function loadFrame(model, level, fxx) {
       const padFxx = String(fxx).padStart(3, '0');
-      // Subfolder routing matching download.py & GitHub Actions workflow output
-      const basePath = `textures/${model.toLowerCase()}/${model.toLowerCase()}_${level}_f${String(fxx).padStart(2, '0')}`;
+      // Subfolder targeting per model
+      const basePath = `textures/${model}/${model}_${level}_${padFxx}`;
 
       try {
         const metaRes = await fetch(`${basePath}.json`, { cache: 'no-cache' });
@@ -682,12 +639,12 @@
         }
         updateTimeUI();
 
-        // 1. Visual background contour
+        // Background Image
         const bgImg = await new Promise((resolve, reject) => {
           const i = new Image();
           i.crossOrigin = 'anonymous';
           i.onload = () => resolve(i);
-          i.onerror = () => reject(new Error('BG PNG missing'));
+          i.onerror = () => reject(new Error('Background Image missing'));
           i.src = `${basePath}.png`;
         });
 
@@ -697,12 +654,12 @@
         globeMat.map = bgTex;
         globeMat.needsUpdate = true;
 
-        // 2. Vector UV Texture (_uv.png)
+        // Vector UV Image
         const uvImg = await new Promise((resolve, reject) => {
           const i = new Image();
           i.crossOrigin = 'anonymous';
           i.onload = () => resolve(i);
-          i.onerror = () => reject(new Error('UV PNG missing'));
+          i.onerror = () => reject(new Error('UV Image missing'));
           i.src = `${basePath}_uv.png`;
         });
 
@@ -905,7 +862,7 @@
 
     document.getElementById('fxxSlider').addEventListener('input', e => {
       currentFxx = parseInt(e.target.value);
-      document.getElementById('fxxVal').innerText = `+${String(currentFxx).padStart(2, '0')}h`;
+      document.getElementById('fxxVal').innerText = `+${String(currentFxx).padStart(3, '0')}h`;
       updateTimeUI();
       loadFrame(currentModel, currentLevel, currentFxx);
     });

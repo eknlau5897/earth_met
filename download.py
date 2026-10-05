@@ -1,231 +1,262 @@
 import os
-import shutil
-import datetime
+import sys
+import json
+import subprocess
+from datetime import datetime, timezone, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
-import matplotlib.pyplot as plt
-import cartopy.crs as ccrs
-import cartopy.feature as cfeature
-from herbie import Herbie
+import xarray as xr
+from scipy.interpolate import RegularGridInterpolator
+from PIL import Image
 
-# Set textures base path and target models
-TEXTURES_DIR = "textures"
-MODELS = ["gfs", "aigfs", "ifs", "aifs"]
+try:
+    from herbie import Herbie
+except ImportError:
+    print("Herbie is missing. Install via: pip install herbie-data xarray cfgrib pillow numpy scipy")
+    sys.exit(1)
 
-# Create subdirectories for each model
-for model in MODELS:
-    os.makedirs(os.path.join(TEXTURES_DIR, model), exist_ok=True)
+BASE_OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "textures")
+FXX_RANGE = list(range(0, 241, 6))
 
-def get_latest_cycle():
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
-    if now_utc.hour >= 19:
-        return now_utc.strftime("%Y-%m-%d 12:00")
-    elif now_utc.hour >= 7:
-        return now_utc.strftime("%Y-%m-%d 00:00")
+MODELS = ["gfs", "ifs", "aifs"]
+LEVELS = ["10m", "925hPa", "850hPa", "700hPa", "500hPa", "200hPa"]
+MAX_WORKERS = 4  # Adjust parallel workers based on memory/network bandwidth
+
+# Optimized resolution for WebGL GPU textures
+TARGET_LONS = np.linspace(0.0, 360.0, 512, endpoint=True)
+TARGET_LATS = np.linspace(90.0, -90.0, 256, endpoint=True)
+
+WINDY_STOPS = [
+    (0.00, np.array([50, 0, 100])),   # 0 kts: Deep Purple
+    (0.15, np.array([0, 0, 255])),    # 15 kts: Blue
+    (0.30, np.array([0, 170, 255])),  # 30 kts: Cyan
+    (0.45, np.array([0, 255, 0])),    # 45 kts: Green
+    (0.60, np.array([255, 255, 0])),  # 60 kts: Yellow
+    (0.75, np.array([255, 127, 0])),  # 75 kts: Orange
+    (0.90, np.array([255, 0, 0])),    # 90 kts: Red
+    (1.00, np.array([255, 0, 255]))   # 100+ kts: Magenta
+]
+
+def clear_texture_cache():
+    """Clears existing texture files across model subdirectories."""
+    for model in MODELS:
+        model_dir = os.path.join(BASE_OUTPUT_DIR, model)
+        if os.path.exists(model_dir):
+            for file in os.listdir(model_dir):
+                if file.endswith((".png", ".json")):
+                    try:
+                        os.remove(os.path.join(model_dir, file))
+                    except Exception as e:
+                        print(f"Error removing {file} in {model}: {e}")
+        else:
+            os.makedirs(model_dir, exist_ok=True)
+    print("Cleared previous texture frame history across model directories.")
+
+def get_windy_rgb(speed_ms):
+    """Calculates Windy-style continuous RGB palette array from wind speeds (m/s)."""
+    knots = speed_ms * 1.94384
+    norm = np.clip(knots / 100.0, 0.0, 1.0)
+    
+    r = np.zeros_like(norm, dtype=np.float32)
+    g = np.zeros_like(norm, dtype=np.float32)
+    b = np.zeros_like(norm, dtype=np.float32)
+
+    for i in range(len(WINDY_STOPS) - 1):
+        pos_low, color_low = WINDY_STOPS[i]
+        pos_high, color_high = WINDY_STOPS[i + 1]
+
+        mask = (norm >= pos_low) & (norm <= pos_high)
+        if np.any(mask):
+            t = (norm[mask] - pos_low) / (pos_high - pos_low)
+            r[mask] = color_low[0] + t * (color_high[0] - color_low[0])
+            g[mask] = color_low[1] + t * (color_high[1] - color_low[1])
+            b[mask] = color_low[2] + t * (color_high[2] - color_low[2])
+
+    return np.stack([r, g, b], axis=-1)
+
+def get_model_product(model, level):
+    """Maps model name and atmospheric level to Herbie product identifiers."""
+    if model == "gfs":
+        return "pgrb2.0p25"
+    elif model in ["ifs", "aifs"]:
+        return "oper"
+    return None
+
+def get_search_query(model, level, var_type):
+    """Generates regex patterns for index searches."""
+    is_ifs = model in ["ifs", "aifs"]
+    if level == "10m":
+        if is_ifs:
+            return ":10u:" if var_type == 'u' else ":10v:"
+        else:
+            return ":UGRD:10 m above ground:" if var_type == 'u' else ":VGRD:10 m above ground:"
     else:
-        yesterday = now_utc - datetime.timedelta(days=1)
-        return yesterday.strftime("%Y-%m-%d 12:00")
+        hpa = level.replace("hPa", "")
+        if is_ifs:
+            return f":u:{hpa}:" if var_type == 'u' else f":v:{hpa}:"
+        else:
+            return f":UGRD:{hpa} mb:" if var_type == 'u' else f":VGRD:{hpa} mb:"
 
-CYCLE_DATE = get_latest_cycle()
-print(f"Executing workflow for model run cycle: {CYCLE_DATE}")
+def fast_regrid_360(ds):
+    """Fast Scipy-backed 2D grid regularizer for global target resolution."""
+    lon_key = 'longitude' if 'longitude' in ds.coords else 'lon'
+    lat_key = 'latitude' if 'latitude' in ds.coords else 'lat'
 
-DOMAINS = {
-    "east_asia": [100, 150, 10, 50],
-    "south_china": [105, 122, 18, 26],
-    "nw_pacific": [105, 165, 0, 45]
-}
-
-def clean_herbie_cache():
-    """Removes temporary raw GRIB/idx files downloaded by Herbie."""
-    cache_dir = os.path.expanduser("~/rubicon_data")
-    if os.path.exists(cache_dir):
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        print("Cleared Herbie temporary file cache.")
-
-def get_save_path(model, domain_key, var_key, fxx, file_type="png"):
-    """
-    Saves outputs in model-specific subdirectories:
-    e.g., textures/gfs/gfs_500hpa_mslp_east_asia_f00.png
-          textures/aigfs/aigfs_10m_wind_mslp_south_china_f12.png
-    """
-    model_lower = model.lower()
-    ext = "json" if file_type == "json" else "png"
-    filename = f"{model_lower}_{var_key}_{domain_key}_f{fxx:02d}.{ext}"
-    return os.path.join(TEXTURES_DIR, model_lower, filename)
-
-def create_base_map(domain_key):
-    fig = plt.figure(figsize=(12, 9), dpi=150)
-    ax = plt.axes(projection=ccrs.PlateCarree())
-    extent = DOMAINS[domain_key]
-    ax.set_extent(extent, crs=ccrs.PlateCarree())
-
-    scale = "10m" if domain_key == "south_china" else "50m"
-    ax.add_feature(cfeature.COASTLINE.with_scale(scale), linewidth=0.8, edgecolor="black")
-    ax.add_feature(cfeature.BORDERS.with_scale(scale), linewidth=0.5, edgecolor="black")
-
-    gl = ax.gridlines(draw_labels=True, linewidth=0.3, color='gray', alpha=0.5, linestyle='--')
-    gl.top_labels, gl.right_labels = False, True
-    return fig, ax
-
-def get_herbie_params(model):
-    model_lower = model.lower()
-    if model_lower in ["gfs"]:
-        return "gfs", "pgrb2.0p25", {
-            "hgt500": ":HGT:500 mb:",
-            "mslp": ":PRMSL:mean sea level:",
-            "u850": ":UGRD:850 mb:",
-            "v850": ":VGRD:850 mb:",
-            "u10": ":UGRD:10 m above ground:",
-            "v10": ":VGRD:10 m above ground:",
-            "t2m": ":TMP:2 m above ground:"
-        }
-    elif model_lower == "aigfs":
-        return "aigfs", "pgrb2.0p25", {
-            "hgt500": ":HGT:500 mb:",
-            "mslp": ":PRMSL:mean sea level:",
-            "u850": ":UGRD:850 mb:",
-            "v850": ":VGRD:850 mb:",
-            "u10": ":UGRD:10 m above ground:",
-            "v10": ":VGRD:10 m above ground:",
-            "t2m": ":TMP:2 m above ground:"
-        }
-    elif model_lower in ["ifs", "ecmwf"]:
-        return "ifs", "oper", {
-            "hgt500": ":gh:500",
-            "mslp": ":msl:",
-            "u850": ":u:850",
-            "v850": ":v:850",
-            "u10": ":10u:",
-            "v10": ":10v:",
-            "t2m": ":2t:"
-        }
-    elif model_lower == "aifs":
-        return "aifs", "oper", {
-            "hgt500": ":gh:500",
-            "mslp": ":msl:",
-            "u850": ":u:850",
-            "v850": ":v:850",
-            "u10": ":10u:",
-            "v10": ":10v:",
-            "t2m": ":2t:"
-        }
-    else:
-        raise ValueError(f"Unsupported model: {model}")
-
-def fetch_herbie_ds(model_name, product, fxx, search_pattern):
-    H = Herbie(CYCLE_DATE, model=model_name, product=product, fxx=fxx)
-    ds = H.xarray(search_pattern)
-    return ds
-
-def extract_coords_and_grid(ds):
     data_var = list(ds.data_vars)[0]
-    vals = ds[data_var].values.squeeze()
-    lons, lats = ds.longitude.values, ds.latitude.values
-    if lons.ndim == 1 and lats.ndim == 1:
-        lons, lats = np.meshgrid(lons, lats)
-    return lons, lats, vals
+    vals = np.squeeze(ds[data_var].values)
+    lons = ds[lon_key].values
+    lats = ds[lat_key].values
 
-def plot_500hpa_mslp(model="ifs", domain_key="east_asia", fxx=0):
-    herbie_model, product, patterns = get_herbie_params(model)
-    ds_hgt = fetch_herbie_ds(herbie_model, product, fxx, patterns["hgt500"])
-    ds_mslp = fetch_herbie_ds(herbie_model, product, fxx, patterns["mslp"])
+    # Handle negative longitudes (-180..180 -> 0..360)
+    if np.any(lons < 0):
+        lons = np.where(lons < 0, lons + 360.0, lons)
+        sort_idx = np.argsort(lons)
+        lons = lons[sort_idx]
+        vals = vals[..., sort_idx] if vals.ndim == 2 else vals[..., :, sort_idx]
 
-    lons, lats, hgt_vals = extract_coords_and_grid(ds_hgt)
-    _, _, mslp_vals = extract_coords_and_grid(ds_mslp)
+    # Ensure latitude is strictly ascending for Scipy RegularGridInterpolator
+    if lats[0] > lats[-1]:
+        lats = lats[::-1]
+        vals = np.flip(vals, axis=0)
 
-    hgt_dagpm = hgt_vals / 10.0 if hgt_vals.max() > 2000 else hgt_vals
-    mslp_hpa = mslp_vals / 100.0 if mslp_vals.max() > 2000 else mslp_vals
+    # Cyclic boundary wrap for longitude (0 to 360)
+    if lons[-1] < 360.0:
+        lons = np.append(lons, 360.0)
+        vals = np.concatenate([vals, vals[:, :1]], axis=1)
 
-    fig, ax = create_base_map(domain_key)
-    ax.contourf(lons, lats, hgt_dagpm, levels=np.arange(500, 600, 4), cmap="YlOrRd", transform=ccrs.PlateCarree())
-    cs = ax.contour(lons, lats, mslp_hpa, levels=np.arange(960, 1048, 4), colors="black", linewidths=1.0, transform=ccrs.PlateCarree())
-    ax.clabel(cs, inline=True, fontsize=8, fmt="%d")
+    interp = RegularGridInterpolator((lats, lons), vals, method="linear", bounds_error=False, fill_value=None)
+    
+    mesh_lats, mesh_lons = np.meshgrid(TARGET_LATS, TARGET_LONS, indexing='ij')
+    regrid_vals = interp((mesh_lats, mesh_lons))
 
-    plt.title(f"{model.upper()} | 500hPa HGT + MSLP | {domain_key.upper()} | +{fxx:02d}h", fontsize=11, fontweight="bold")
-    plt.savefig(get_save_path(model, domain_key, "500hpa_mslp", fxx), bbox_inches="tight")
-    plt.close()
+    return regrid_vals
 
-def plot_850hpa_wind(model="ifs", domain_key="east_asia", fxx=0):
-    herbie_model, product, patterns = get_herbie_params(model)
-    ds_u = fetch_herbie_ds(herbie_model, product, fxx, patterns["u850"])
-    ds_v = fetch_herbie_ds(herbie_model, product, fxx, patterns["v850"])
+def ensure_caffeinated():
+    """Prevents macOS system sleep during computational batch runs."""
+    if sys.platform == "darwin" and "CAFFEINATED" not in os.environ:
+        print("Preventing macOS sleep via caffeinate...")
+        env = os.environ.copy()
+        env["CAFFEINATED"] = "1"
+        cmd = ["caffeinate", "-i", "-w", str(os.getpid()), sys.executable] + sys.argv
+        sys.exit(subprocess.call(cmd, env=env))
 
-    lons, lats, u = extract_coords_and_grid(ds_u)
-    _, _, v = extract_coords_and_grid(ds_v)
-    wind_kts = np.sqrt(u**2 + v**2) * 1.94384
+def get_latest_available_cycle():
+    """Computes the latest reliable model output cycle timestamp (UTC)."""
+    now_utc = datetime.now(timezone.utc)
+    hour = now_utc.hour
 
-    fig, ax = create_base_map(domain_key)
-    cf = ax.contourf(lons, lats, wind_kts, levels=np.arange(10, 75, 5), cmap="YlGnBu", transform=ccrs.PlateCarree())
-    plt.colorbar(cf, ax=ax, orientation="horizontal", pad=0.04, shrink=0.7, label="850hPa Wind Speed (kts)")
+    if hour >= 20:
+        cycle_date, cycle_hour = now_utc, "12"
+    elif hour >= 14:
+        cycle_date, cycle_hour = now_utc, "06"
+    elif hour >= 8:
+        cycle_date, cycle_hour = now_utc, "00"
+    elif hour >= 2:
+        cycle_date, cycle_hour = now_utc - timedelta(days=1), "18"
+    else:
+        cycle_date, cycle_hour = now_utc - timedelta(days=1), "12"
 
-    skip = 3 if domain_key == "south_china" else 6
-    ax.barbs(lons[::skip, ::skip], lats[::skip, ::skip], u[::skip, ::skip], v[::skip, ::skip], length=5, transform=ccrs.PlateCarree())
+    return f"{cycle_date.strftime('%Y-%m-%d')} {cycle_hour}:00"
 
-    plt.title(f"{model.upper()} | 850hPa Wind | {domain_key.upper()} | +{fxx:02d}h", fontsize=11, fontweight="bold")
-    plt.savefig(get_save_path(model, domain_key, "850hpa_wind", fxx), bbox_inches="tight")
-    plt.close()
+def process_frame(u, v, model_name, level, fxx, cycle_str):
+    """Encodes standard magnitude and normalized UV PNG textures + metadata JSON into model-specific directories."""
+    u = np.nan_to_num(np.squeeze(u), nan=0.0)
+    v = np.nan_to_num(np.squeeze(v), nan=0.0)
 
-def plot_10m_wind_mslp(model="ifs", domain_key="east_asia", fxx=0):
-    herbie_model, product, patterns = get_herbie_params(model)
-    ds_u10 = fetch_herbie_ds(herbie_model, product, fxx, patterns["u10"])
-    ds_v10 = fetch_herbie_ds(herbie_model, product, fxx, patterns["v10"])
-    ds_mslp = fetch_herbie_ds(herbie_model, product, fxx, patterns["mslp"])
+    speed = np.sqrt(u**2 + v**2)
 
-    lons, lats, u10 = extract_coords_and_grid(ds_u10)
-    _, _, v10 = extract_coords_and_grid(ds_v10)
-    _, _, mslp_vals = extract_coords_and_grid(ds_mslp)
+    u_min, u_max = float(np.min(u)), float(np.max(u))
+    v_min, v_max = float(np.min(v)), float(np.max(v))
 
-    mslp_hpa = mslp_vals / 100.0 if mslp_vals.max() > 2000 else mslp_vals
-    wind10_kts = np.sqrt(u10**2 + v10**2) * 1.94384
+    rgb_filled = get_windy_rgb(speed).astype(np.uint8)
+    
+    # Safe normalizations to avoid zero division edge cases
+    u_denom = (u_max - u_min) if (u_max - u_min) > 1e-6 else 1.0
+    v_denom = (v_max - v_min) if (v_max - v_min) > 1e-6 else 1.0
 
-    fig, ax = create_base_map(domain_key)
-    cf = ax.contourf(lons, lats, wind10_kts, levels=np.arange(10, 65, 5), cmap="Spectral_r", transform=ccrs.PlateCarree())
-    plt.colorbar(cf, ax=ax, orientation="horizontal", pad=0.04, shrink=0.7, label="10m Wind Speed (kts)")
+    u_norm = np.clip(255 * (u - u_min) / u_denom, 0, 255).astype(np.uint8)
+    v_norm = np.clip(255 * (v - v_min) / v_denom, 0, 255).astype(np.uint8)
 
-    cs = ax.contour(lons, lats, mslp_hpa, levels=np.arange(960, 1048, 4), colors="black", linewidths=1.2, transform=ccrs.PlateCarree())
-    ax.clabel(cs, inline=True, fontsize=8, fmt="%d")
+    height, width = u.shape
+    vector_rgba = np.zeros((height, width, 4), dtype=np.uint8)
+    vector_rgba[..., 0] = u_norm
+    vector_rgba[..., 1] = v_norm
+    vector_rgba[..., 2] = 0
+    vector_rgba[..., 3] = 255
 
-    skip = 3 if domain_key == "south_china" else 6
-    ax.barbs(lons[::skip, ::skip], lats[::skip, ::skip], u10[::skip, ::skip]*3.6/1.852, v10[::skip, ::skip]*3.6/1.852, length=4.5, transform=ccrs.PlateCarree())
+    bg_img = Image.fromarray(rgb_filled, mode="RGB")
+    vec_img = Image.fromarray(vector_rgba, mode="RGBA")
 
-    plt.title(f"{model.upper()} | 10m Wind + MSLP | {domain_key.upper()} | +{fxx:02d}h", fontsize=11, fontweight="bold")
-    plt.savefig(get_save_path(model, domain_key, "10m_wind_mslp", fxx), bbox_inches="tight")
-    plt.close()
+    # Target output folder: textures/{model}/
+    model_dir = os.path.join(BASE_OUTPUT_DIR, model_name)
+    os.makedirs(model_dir, exist_ok=True)
 
-def plot_2m_temp(model="ifs", domain_key="east_asia", fxx=0):
-    herbie_model, product, patterns = get_herbie_params(model)
-    ds_t2m = fetch_herbie_ds(herbie_model, product, fxx, patterns["t2m"])
-    ds_mslp = fetch_herbie_ds(herbie_model, product, fxx, patterns["mslp"])
+    filename_base = f"{model_name}_{level}_{fxx:03d}"
+    
+    bg_img.save(os.path.join(model_dir, f"{filename_base}.png"))
+    vec_img.save(os.path.join(model_dir, f"{filename_base}_uv.png"))
 
-    lons, lats, t2m_vals = extract_coords_and_grid(ds_t2m)
-    _, _, mslp_vals = extract_coords_and_grid(ds_mslp)
+    meta = {
+        "uMin": u_min, "uMax": u_max,
+        "vMin": v_min, "vMax": v_max,
+        "width": width, "height": height,
+        "lonRange": [0.0, 360.0],
+        "latRange": [-90.0, 90.0],
+        "fxx": fxx, "model": model_name, "level": level,
+        "cycle": cycle_str
+    }
+    with open(os.path.join(model_dir, f"{filename_base}.json"), "w") as f:
+        json.dump(meta, f)
 
-    t2m_c = t2m_vals - 273.15 if t2m_vals.max() > 150 else t2m_vals
-    mslp_hpa = mslp_vals / 100.0 if mslp_vals.max() > 2000 else mslp_vals
+def fetch_and_process_task(model_name, level, fxx, target_cycle):
+    """Individual unit step task for thread worker executor."""
+    try:
+        product = get_model_product(model_name, level)
+        u_search = get_search_query(model_name, level, 'u')
+        v_search = get_search_query(model_name, level, 'v')
 
-    fig, ax = create_base_map(domain_key)
-    cf = ax.contourf(lons, lats, t2m_c, levels=np.arange(-10, 42, 2), cmap="coolwarm", transform=ccrs.PlateCarree(), extend="both")
-    plt.colorbar(cf, ax=ax, orientation="horizontal", pad=0.04, shrink=0.7, label="2m Temperature (°C)")
+        H = Herbie(target_cycle, model=model_name, product=product, fxx=fxx)
+        ds_u = H.xarray(u_search)
+        ds_v = H.xarray(v_search)
 
-    cs = ax.contour(lons, lats, mslp_hpa, levels=np.arange(960, 1048, 4), colors="black", linewidths=1.0, transform=ccrs.PlateCarree())
-    ax.clabel(cs, inline=True, fontsize=8, fmt="%d")
+        u_grid = fast_regrid_360(ds_u)
+        v_grid = fast_regrid_360(ds_v)
 
-    plt.title(f"{model.upper()} | 2m Temperature + MSLP | {domain_key.upper()} | +{fxx:02d}h", fontsize=11, fontweight="bold")
-    plt.savefig(get_save_path(model, domain_key, "2m_temp", fxx), bbox_inches="tight")
-    plt.close()
+        process_frame(u_grid, v_grid, model_name, level, fxx, target_cycle)
+        return f"Saved: textures/{model_name}/{model_name}_{level}_{fxx:03d}.png"
+    except Exception as e:
+        return f"Failed {model_name.upper()} {level} +{fxx:03d}h: {e}"
+
+def run_update():
+    clear_texture_cache()
+    target_cycle = get_latest_available_cycle()
+    print(f"\n==================================================")
+    print(f"[{datetime.now(timezone.utc)}] Running multi-level update for cycle: {target_cycle}")
+    print(f"==================================================\n")
+
+    tasks = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for model_name in MODELS:
+            for level in LEVELS:
+                for fxx in FXX_RANGE:
+                    tasks.append(
+                        executor.submit(fetch_and_process_task, model_name, level, fxx, target_cycle)
+                    )
+
+        for future in as_completed(tasks):
+            print(future.result())
+
+    manifest = {
+        "cycle": target_cycle,
+        "models": MODELS,
+        "levels": LEVELS,
+        "lonRange": [0.0, 360.0],
+        "updatedAt": datetime.now(timezone.utc).isoformat()
+    }
+    with open(os.path.join(BASE_OUTPUT_DIR, "manifest.json"), "w") as f:
+        json.dump(manifest, f)
+    print("\nBatch multi-level update complete!")
 
 if __name__ == "__main__":
-    DOMAINS_TO_RUN = ["east_asia", "south_china", "nw_pacific"]
-    FORECAST_HOURS = list(range(0, 121, 6)) + list(range(132, 229, 12))
-
-    for model in MODELS:
-        for domain in DOMAINS_TO_RUN:
-            for fxx in FORECAST_HOURS:
-                try:
-                    plot_500hpa_mslp(model=model, domain_key=domain, fxx=fxx)
-                    plot_850hpa_wind(model=model, domain_key=domain, fxx=fxx)
-                    plot_10m_wind_mslp(model=model, domain_key=domain, fxx=fxx)
-                    plot_2m_temp(model=model, domain_key=domain, fxx=fxx)
-                except Exception as e:
-                    print(f"Error {model} {domain} f{fxx:02d}: {e}")
-
-    clean_herbie_cache()
+    ensure_caffeinated()
+    run_update()
