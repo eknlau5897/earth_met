@@ -11,41 +11,58 @@ permissions:
 
 jobs:
   generate-textures:
-    runs-on: macos-latest # Runs on macOS instead of Ubuntu
+    runs-on: macos-latest # Runs on macOS runner
 
     steps:
+      # Step 1: Check out the repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      # Step 2: Set up Python without cache checking errors
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: 'pip'
 
-      - name: Install macOS system dependencies (eccodes for GRIB2 via Homebrew)
+      # Step 3: Install C-libraries for GRIB2 processing via Homebrew
+      - name: Install macOS system dependencies
         run: |
           brew update
           brew install eccodes
 
+      # Step 4: Install Python requirements directly
       - name: Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install herbie-data xarray cfgrib pillow numpy scipy
 
+      # Step 5: Clear Herbie GRIB download cache and output textures folder
+      - name: Clear all caches and old texture storage
+        run: |
+          rm -rf ~/.cache/herbie
+          rm -rf textures/
+          mkdir -p textures
+
+      # Step 6: Execute the texture generator script
       - name: Run texture generator script
         run: |
           python download.py
 
+      # Step 7: Commit updated textures and manifest for earth_met.html
       - name: Commit and push updated textures in a single commit
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
           
-          # Stage all generated output inside the textures directory
+          # Stage generated textures folder and web assets
           git add textures/
           
-          # Commit only if there are actual texture changes
+          # Stage html if tracked or modified
+          if [ -f "earth_met.html" ]; then
+            git add earth_met.html
+          fi
+          
+          # Commit only if there are actual changes
           if ! git diff --cached --quiet; then
             git commit -m "update: automated wind texture frames update [skip ci]"
             git push
