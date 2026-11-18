@@ -1,1 +1,1 @@
-{"cycle": "2026-11-17 12:00", "models": ["gfs", "ifs", "aifs"], "levels": ["10m", "925hPa", "850hPa", "700hPa", "500hPa", "200hPa"], "lonRange": [0.0, 360.0], "updatedAt": "2026-11-17T23:46:39.275057+00:00"}
+{"cycle": "2026-11-18 00:00", "models": ["gfs", "ifs", "aifs"], "levels": ["10m", "925hPa", "850hPa", "700hPa", "500hPa", "200hPa"], "lonRange": [0.0, 360.0], "updatedAt": "2026-11-18T13:41:26.389620+00:00"}
